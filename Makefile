@@ -36,9 +36,10 @@ AVRDUDE_FLAGS += -c wiring
 OBJS = $(KERNEL_DIR)/tcb.o \
        $(KERNEL_DIR)/tcb_list.o \
        $(KERNEL_DIR)/scheduler.o \
+       $(KERNEL_DIR)/semaphore.o \
        $(ARCH_DIR)/uart.o \
        $(ARCH_DIR)/atomport_asm.o \
-       $(ARCH_DIR)/timer.o \
+       $(ARCH_DIR)/timer.o
 
 # --- AUTOMATIC DEPENDENCY FILES LIST ---
 # This matches every .o file in OBJS and converts its extension to .d

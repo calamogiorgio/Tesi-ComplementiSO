@@ -27,11 +27,15 @@ void startSchedule(void){
 
 void schedule(void) {
   TCB* old_tcb=current_tcb;
-  // we put back the current thread in the queue
-  TCBList_enqueue(&running_queue, current_tcb);
+  if (current_tcb->status != Waiting) {
+    current_tcb->status = Ready;
+    // we put back the current thread in the queue
+    TCBList_enqueue(&running_queue, current_tcb);
+}
 
   // we fetch the next;
   current_tcb=TCBList_dequeue(&running_queue);
+  current_tcb->status = Running;
   // we jump to it (useless if it is the only process)
   if (old_tcb!=current_tcb)
     swapContext(old_tcb, current_tcb);
