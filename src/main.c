@@ -10,6 +10,7 @@
 #include "atomport_asm.h"
 #include "scheduler.h"
 #include "semaphore.h"
+#include "message_queue.h"
 
 #define THREAD_STACK_SIZE 256
 #define IDLE_STACK_SIZE 128
@@ -17,6 +18,9 @@
 
 /* Semaphore declarations */
 Semaphore sem[NUM_PROCESSES];
+
+/* Global Message Queue declaration */
+MessageQueue my_queue;
 
 /* Thread structures */
 TCB tcb[NUM_PROCESSES];
@@ -35,25 +39,51 @@ void idle_fn(uint32_t thread_arg __attribute__((unused))) {
   }
 }
 
-void process_sequence_loop(uint32_t arg) {
+void producer_fn(uint32_t arg) {
     uint8_t id = (uint8_t)arg;
-    uint8_t next_id;
-    
-    /* Calculate the next process ID in the circular chain */
-    if (id == NUM_PROCESSES - 1) {
-        next_id = 0;
-    } else {
-        next_id = id + 1;
-    }
+    uint8_t half = NUM_PROCESSES >> 1;
+    uint8_t target_consumer = id + half;
+    char* msg = "Hello World!";
 
     while(1) {
-        /* Wait for this process's turn */
+        /* 1. Wait for producer's turn */
         sem_wait(&sem[id]);
+
+        /* 2. Send the message to the queue */
+        msg_send(&my_queue, msg);
+
+        /* 3. Wake up the target consumer */
+        sem_post(&sem[target_consumer]);
         
-        printf("p%d\n", id + 1);
-        
-        /* Wake up the next process in the sequence */
-        sem_post(&sem[next_id]);
+        _delay_ms(500);
+    }
+}
+
+void consumer_fn(uint32_t arg) {
+    uint8_t id = (uint8_t)arg;
+    uint8_t half = NUM_PROCESSES >> 1;
+    uint8_t target_producer = id - half; /* The associated producer */
+    char* received_msg = NULL;
+
+    while(1) {
+        /* 1. Wait for the consumer's turn */
+        sem_wait(&sem[id]);
+
+        /* 2. Receive the message from the queue */
+        msg_receive(&my_queue, (void**)&received_msg);
+
+        /* 3. Print the result safely */
+        cli();
+        printf("C%d received from P%d: %s\n", id, target_producer, received_msg);
+        sei();
+
+        /* 4. Pass the turn back to the next producer */
+        uint8_t next_producer = target_producer + 1;
+
+        if (next_producer == half) {
+            next_producer = 0;
+        }
+        sem_post(&sem[next_producer]);
     }
 }
 
@@ -66,6 +96,9 @@ int main(void) {
   /* Initialize semaphores: P1 starts free, the others starts blocked */
   sem_init(&sem[0], 1);
 
+  /* Initialize the message queue */
+  msg_queue_init(&my_queue);
+
   for (i = 1; i < NUM_PROCESSES; i++) {
     sem_init(&sem[i],0);
   }
@@ -77,11 +110,16 @@ int main(void) {
             idle_fn,
             0);
 
+  uint8_t half = NUM_PROCESSES >> 1;
+
   for (i = 0; i < NUM_PROCESSES; i++) {
-      TCB_create(&tcb[i],
-                &tcb_stack[i][THREAD_STACK_SIZE - 1],
-                process_sequence_loop,
-                i); /* Passing index as an argument*/
+      if (i < half) {
+          /* Task creation for Producers */
+          TCB_create(&tcb[i], &tcb_stack[i][THREAD_STACK_SIZE - 1], producer_fn, i);
+      } else {
+          /* Task creation for Consumers */
+          TCB_create(&tcb[i], &tcb_stack[i][THREAD_STACK_SIZE - 1], consumer_fn, i);
+      }
   }
 
   /* Insert threads into the ready queue */
