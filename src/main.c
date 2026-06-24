@@ -1,9 +1,8 @@
 #include <avr/interrupt.h>
 #include <avr/io.h>
-#include <assert.h>
-#include <util/delay.h>
 #include <stdint.h>
-#include <stdio.h>
+#include <util/delay.h>
+
 #include "tcb.h"
 #include "tcb_list.h"
 #include "uart.h"
@@ -13,37 +12,70 @@
 #include "message_queue.h"
 
 #define THREAD_STACK_SIZE 256
-#define IDLE_STACK_SIZE 128
-#define NUM_PROCESSES 10
+#define IDLE_STACK_SIZE   128
+#define NUM_PROCESSES     20
 
-/* Semaphore declarations */
+/* Synchronization and communication resources */
 Semaphore sem[NUM_PROCESSES];
-
-/* Global Message Queue declaration */
 MessageQueue my_queue;
 
-/* Thread structures */
+/* Thread management structures */
 TCB tcb[NUM_PROCESSES];
 uint8_t tcb_stack[NUM_PROCESSES][THREAD_STACK_SIZE];
 
-/* Idle thread structures and function */
 TCB idle_tcb;
 uint8_t idle_stack[IDLE_STACK_SIZE];
 
-void idle_fn(uint32_t thread_arg __attribute__((unused))) {
-  while(1) {
-    cli();
-    printf("i\n");
-    sei();
-    _delay_ms(100);
-  }
+/**
+ * Generic lightweight integer-to-ASCII printer via UART.
+ * Replaces the heavy standard library engine and works dynamically
+ * regardless of the number of digits.
+ */
+void my_itoa(uint32_t num) {
+    char buf[11]; /* Buffer to hold up to the maximum 32-bit integer + \0 */
+    int i = 0;
+
+    /* Handle the zero case explicitly */
+    if (num == 0) {
+        usart_putchar('0');
+        return;
+    }
+
+    /* Extract digits from right to left */
+    while (num > 0) {
+        buf[i++] = (num % 10) + '0';
+        num /= 10;
+    }
+
+    /* Print the buffer in reverse order to correct the number orientation */
+    while (i > 0) {
+        usart_putchar(buf[--i]);
+    }
 }
 
+/**
+ * Silent Idle Thread
+ * Runs continuously when no other thread is ready.
+ */
+void idle_fn(uint32_t thread_arg __attribute__((unused))) {
+    while(1) {
+        asm volatile("nop");
+    }
+}
+
+/**
+ * Producer Thread
+ * Waits for its synchronized turn, posts a message, and signals its consumer.
+ */
 void producer_fn(uint32_t arg) {
     uint8_t id = (uint8_t)arg;
     uint8_t half = NUM_PROCESSES >> 1;
     uint8_t target_consumer = id + half;
     char* msg = "Hello World!";
+
+    if (id == 0) {
+        usart_pstr("Kernel Initialized Successfully!\n");
+    }
 
     while(1) {
         /* 1. Wait for producer's turn */
@@ -55,14 +87,19 @@ void producer_fn(uint32_t arg) {
         /* 3. Wake up the target consumer */
         sem_post(&sem[target_consumer]);
         
-        _delay_ms(500);
+        /* 4. Let the hardware UART breathe and avoid queue saturation */
+        _delay_ms(50); 
     }
 }
 
+/**
+ * Consumer Thread (No printf wrapper used to save stack memory)
+ * Fetches the message, prints it sequentially, and triggers the next producer.
+ */
 void consumer_fn(uint32_t arg) {
     uint8_t id = (uint8_t)arg;
     uint8_t half = NUM_PROCESSES >> 1;
-    uint8_t target_producer = id - half; /* The associated producer */
+    uint8_t target_producer = id - half; 
     char* received_msg = NULL;
 
     while(1) {
@@ -72,66 +109,60 @@ void consumer_fn(uint32_t arg) {
         /* 2. Receive the message from the queue */
         msg_receive(&my_queue, (void**)&received_msg);
 
-        /* 3. Print the result safely */
-        cli();
-        printf("C%d received from P%d: %s\n", id, target_producer, received_msg);
-        sei();
+        /* 3. Atomic and sequential UART output using light custom helper functions */
+        usart_pstr("C");
+        my_itoa(id);
+        usart_pstr(" received from P");
+        my_itoa(target_producer);
+        usart_pstr(": ");
+        usart_pstr(received_msg);
+        usart_pstr("\n");
 
-        /* 4. Pass the turn back to the next producer */
+        /* 4. Pass the token back to the next producer in a round-robin fashion */
         uint8_t next_producer = target_producer + 1;
-
-        if (next_producer == half) {
+        if (next_producer >= half) {
             next_producer = 0;
         }
         sem_post(&sem[next_producer]);
     }
 }
 
-
 int main(void) {
-  uint8_t i;
-  /* Initialize UART for printf debugging */
-  printf_init();
+    uint8_t i;
+    uint8_t half = NUM_PROCESSES >> 1;
 
-  /* Initialize semaphores: P1 starts free, the others starts blocked */
-  sem_init(&sem[0], 1);
+    /* Initialize the hardware UART peripheral */
+    uart_init();
 
-  /* Initialize the message queue */
-  msg_queue_init(&my_queue);
+    /* Initialize communication channels */
+    msg_queue_init(&my_queue);
 
-  for (i = 1; i < NUM_PROCESSES; i++) {
-    sem_init(&sem[i],0);
-  }
+    /* Initialize Semaphores: Producer 0 starts unlocked (1), all others locked (0) */
+    sem_init(&sem[0], 1);
+    for (i = 1; i < NUM_PROCESSES; i++) {
+        sem_init(&sem[i], 0);
+    }
 
-  /* Create execution contexts for all threads */
+    /* Instantiate execution context for the Idle Thread */
+    TCB_create(&idle_tcb, idle_stack + IDLE_STACK_SIZE - 1, idle_fn, 0);
 
-  TCB_create(&idle_tcb,
-            idle_stack + IDLE_STACK_SIZE - 1,
-            idle_fn,
-            0);
+    /* Instantiate execution contexts for Producers and Consumers */
+    for (i = 0; i < NUM_PROCESSES; i++) {
+        if (i < half) {
+            TCB_create(&tcb[i], &tcb_stack[i][THREAD_STACK_SIZE - 1], producer_fn, i);
+        } else {
+            TCB_create(&tcb[i], &tcb_stack[i][THREAD_STACK_SIZE - 1], consumer_fn, i);
+        }
+    }
 
-  uint8_t half = NUM_PROCESSES >> 1;
+    /* Populate the Scheduler Ready Queue */
+    for (i = 0; i < NUM_PROCESSES; i++) {
+        TCBList_enqueue(&running_queue, &tcb[i]);
+    }
+    TCBList_enqueue(&running_queue, &idle_tcb);
 
-  for (i = 0; i < NUM_PROCESSES; i++) {
-      if (i < half) {
-          /* Task creation for Producers */
-          TCB_create(&tcb[i], &tcb_stack[i][THREAD_STACK_SIZE - 1], producer_fn, i);
-      } else {
-          /* Task creation for Consumers */
-          TCB_create(&tcb[i], &tcb_stack[i][THREAD_STACK_SIZE - 1], consumer_fn, i);
-      }
-  }
-
-  /* Insert threads into the ready queue */
-
-  for (i = 0; i < NUM_PROCESSES; i++) {
-    TCBList_enqueue(&running_queue, &tcb[i]);
-  }
-
-  TCBList_enqueue(&running_queue, &idle_tcb);
-
-  printf("starting\n");
-  
-  /* Start the operating system scheduler */
-  startSchedule();
+    /* Handover CPU management to the Cooperative Scheduler */
+    startSchedule();
+    
+    return 0;
 }
