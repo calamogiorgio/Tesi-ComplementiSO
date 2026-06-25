@@ -15,11 +15,11 @@
 #define IDLE_STACK_SIZE   128
 #define NUM_PROCESSES     20
 
-/* Synchronization and communication resources */
+/* Global OS resources */
 Semaphore sem[NUM_PROCESSES];
 MessageQueue my_queue;
 
-/* Thread management structures */
+/* Thread descriptors and stacks */
 TCB tcb[NUM_PROCESSES];
 uint8_t tcb_stack[NUM_PROCESSES][THREAD_STACK_SIZE];
 
@@ -27,45 +27,38 @@ TCB idle_tcb;
 uint8_t idle_stack[IDLE_STACK_SIZE];
 
 /**
- * Generic lightweight integer-to-ASCII printer via UART.
- * Replaces the heavy standard library engine and works dynamically
- * regardless of the number of digits.
+ * Lightweight integer-to-ASCII converter for serial output
  */
 void my_itoa(uint32_t num) {
-    char buf[11]; /* Buffer to hold up to the maximum 32-bit integer + \0 */
+    char buf[11];
     int i = 0;
 
-    /* Handle the zero case explicitly */
     if (num == 0) {
         usart_putchar('0');
         return;
     }
 
-    /* Extract digits from right to left */
     while (num > 0) {
         buf[i++] = (num % 10) + '0';
         num /= 10;
     }
 
-    /* Print the buffer in reverse order to correct the number orientation */
     while (i > 0) {
         usart_putchar(buf[--i]);
     }
 }
 
 /**
- * Silent Idle Thread
- * Runs continuously when no other thread is ready.
+ * Background Idle Thread
  */
 void idle_fn(uint32_t thread_arg __attribute__((unused))) {
     while(1) {
-        asm volatile("nop");
+        asm volatile("nop"); /* Non-blocking operation */
     }
 }
 
 /**
  * Producer Thread
- * Waits for its synchronized turn, posts a message, and signals its consumer.
  */
 void producer_fn(uint32_t arg) {
     uint8_t id = (uint8_t)arg;
@@ -78,23 +71,22 @@ void producer_fn(uint32_t arg) {
     }
 
     while(1) {
-        /* 1. Wait for producer's turn */
+        /* Sync execution turn */
         sem_wait(&sem[id]);
 
-        /* 2. Send the message to the queue */
+        /* Inter-process communication */
         msg_send(&my_queue, msg);
 
-        /* 3. Wake up the target consumer */
+        /* Wake up paired consumer */
         sem_post(&sem[target_consumer]);
         
-        /* 4. Let the hardware UART breathe and avoid queue saturation */
+        /* Pacing delay to prevent buffer flooding */
         _delay_ms(50); 
     }
 }
 
 /**
- * Consumer Thread (No printf wrapper used to save stack memory)
- * Fetches the message, prints it sequentially, and triggers the next producer.
+ * Consumer Thread
  */
 void consumer_fn(uint32_t arg) {
     uint8_t id = (uint8_t)arg;
@@ -103,13 +95,13 @@ void consumer_fn(uint32_t arg) {
     char* received_msg = NULL;
 
     while(1) {
-        /* 1. Wait for the consumer's turn */
+        /* Sync execution turn */
         sem_wait(&sem[id]);
 
-        /* 2. Receive the message from the queue */
+        /* Retrieve data from the shared queue */
         msg_receive(&my_queue, (void**)&received_msg);
 
-        /* 3. Atomic and sequential UART output using light custom helper functions */
+        /* Sequential UART output without brackets */
         usart_pstr("C");
         my_itoa(id);
         usart_pstr(" received from P");
@@ -118,7 +110,7 @@ void consumer_fn(uint32_t arg) {
         usart_pstr(received_msg);
         usart_pstr("\n");
 
-        /* 4. Pass the token back to the next producer in a round-robin fashion */
+        /* Compute and trigger the next producer token in round-robin sequence */
         uint8_t next_producer = target_producer + 1;
         if (next_producer >= half) {
             next_producer = 0;
@@ -131,22 +123,20 @@ int main(void) {
     uint8_t i;
     uint8_t half = NUM_PROCESSES >> 1;
 
-    /* Initialize the hardware UART peripheral */
+    /* Peripherals and OS subsystems initialization */
     uart_init();
-
-    /* Initialize communication channels */
     msg_queue_init(&my_queue);
 
-    /* Initialize Semaphores: Producer 0 starts unlocked (1), all others locked (0) */
+    /* Setup sync token ring: Producer 0 starts active, others blocked */
     sem_init(&sem[0], 1);
     for (i = 1; i < NUM_PROCESSES; i++) {
         sem_init(&sem[i], 0);
     }
 
-    /* Instantiate execution context for the Idle Thread */
+    /* Create background idle environment */
     TCB_create(&idle_tcb, idle_stack + IDLE_STACK_SIZE - 1, idle_fn, 0);
 
-    /* Instantiate execution contexts for Producers and Consumers */
+    /* Allocate runtime workers (Producers and Consumers) */
     for (i = 0; i < NUM_PROCESSES; i++) {
         if (i < half) {
             TCB_create(&tcb[i], &tcb_stack[i][THREAD_STACK_SIZE - 1], producer_fn, i);
@@ -155,13 +145,13 @@ int main(void) {
         }
     }
 
-    /* Populate the Scheduler Ready Queue */
+    /* Enqueue system threads inside the active queue */
     for (i = 0; i < NUM_PROCESSES; i++) {
         TCBList_enqueue(&running_queue, &tcb[i]);
     }
     TCBList_enqueue(&running_queue, &idle_tcb);
 
-    /* Handover CPU management to the Cooperative Scheduler */
+    /* Pass CPU ownership to kernel scheduler */
     startSchedule();
     
     return 0;

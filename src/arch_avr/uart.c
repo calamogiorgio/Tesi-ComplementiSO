@@ -1,135 +1,139 @@
 #include "uart.h"
 #include "tcb.h"
 #include "scheduler.h"
-// ********************************************************************************
-// Includes
-// ********************************************************************************
+#include "semaphore.h"
 #include <avr/io.h>
 #include <avr/interrupt.h>
-#include <stdio.h>
-#include <stdbool.h>
-// ********************************************************************************
-// Macros and Defines
-// ********************************************************************************
+
 #define BAUD 19200
 #define MYUBRR F_CPU/16/BAUD-1
 
+// Static ring buffers for transmission and reception
+static RingBuffer tx_buffer;
+static RingBuffer rx_buffer;
+
+// Semaphores for flow control and thread synchronization
+static Semaphore empty_sem_tx;
+static Semaphore full_sem_rx;
 
 // ********************************************************************************
-// Message Queues Static Instances
+// RingBuffer Related
 // ********************************************************************************
-static MessageQueue rx_queue;
-static MessageQueue tx_queue;
+void RingBuffer_init(RingBuffer *rb) {
+    rb->head = 0;
+    rb->tail = 0;
+}
+
+uint8_t RingBuffer_push(RingBuffer *rb, uint8_t data) {
+    // Check if the buffer is full using bitwise mask optimization
+    if (((rb->head + 1) & (UART_BUFFER_SIZE - 1)) == rb->tail) return ERROR;
+    
+    rb->buffer[rb->head] = data;
+    rb->head = (rb->head + 1) & (UART_BUFFER_SIZE - 1);
+    return OK;
+}
+
+uint8_t RingBuffer_pop(RingBuffer *rb, uint8_t *data) {
+    // Check if the buffer is empty
+    if (rb->head == rb->tail) return ERROR;
+    
+    *data = rb->buffer[rb->tail];
+    rb->tail = (rb->tail + 1) & (UART_BUFFER_SIZE - 1);
+    return OK;
+}
 
 // ********************************************************************************
-// usart Related
+// USART Related
 // ********************************************************************************
-void usart_init( uint16_t ubrr) {
+void usart_init(uint16_t ubrr) {
+    RingBuffer_init(&tx_buffer);
+    RingBuffer_init(&rx_buffer);
 
-    // Initialize message queues for transmission and reception
-    msg_queue_init(&rx_queue);
-    msg_queue_init(&tx_queue);
+    // Initialize semaphores: TX starts free, RX starts empty
+    sem_init(&empty_sem_tx, UART_BUFFER_SIZE);
+    sem_init(&full_sem_rx, 0);
 
-    // Set baud rate
-    UBRR0H = (uint8_t)(ubrr>>8);
+    // Set baud rate registers
+    UBRR0H = (uint8_t)(ubrr >> 8);
     UBRR0L = (uint8_t)ubrr;
-
-    UCSR0C = _BV(UCSZ01) | _BV(UCSZ00); // 8-bit data
-    UCSR0B = _BV(RXEN0) | _BV(TXEN0) | _BV(RXCIE0);   // Enable RX and TX
+    
+    // Set frame format: 8 data bits, 1 stop bit
+    UCSR0C = _BV(UCSZ01) | _BV(UCSZ00); 
+    
+    // Enable receiver, transmitter and receive complete interrupt
+    UCSR0B = _BV(RXEN0) | _BV(TXEN0) | _BV(RXCIE0); 
 }
-// Transmit a character using the message queue
+
 void usart_putchar(char data) {
-    void *message = (void *)(uintptr_t) data;
+    // Block the thread if there is no free space in the TX buffer
+    sem_wait(&empty_sem_tx);
     
-    // Mandiamo il messaggio. msg_send gestisce internamente cli() e sei()
-    uint8_t ret = msg_send(&tx_queue, message);
+    cli();
+    RingBuffer_push(&tx_buffer, (uint8_t)data);
     
-    // Se il carattere è stato bufferizzato, abilita l'interrupt hardware
-    if (ret == OK) {
-        cli();
-        UCSR0B |= _BV(UDRIE0);
-        sei();
-    }
+    // Enable Data Register Empty interrupt to trigger transmission
+    UCSR0B |= _BV(UDRIE0);
+    sei();
 }
 
-
-// Receive a character from the message queue
 char usart_getchar(void) {
-    void *message;
-    uint8_t ret = msg_receive(&rx_queue, &message);
-    // Return the extracted character if available, otherwise return 0
-    if (ret == OK) {
-        char data_extracted = (char)(uintptr_t) message;
-        return data_extracted;
-    }
-    else return 0;
-}
-
-// Interrupt Service Routine for USART0 Data Register Empty
-ISR(USART0_UDRE_vect) {
-    // Check if tx_queue is not empty
-    if (tx_queue.head != tx_queue.tail) {
-        // Extract the message and send it to the hardware register
-        void* message = tx_queue.buffer[tx_queue.tail];
-        char data = (char)(uintptr_t)message;
-        UDR0 = data;
-
-        // Increment the tail index FIRST, so the queue effectively has free space now
-        tx_queue.tail = (tx_queue.tail + 1) & (MQ_MAX_SIZE - 1);
-
-        // Wake up a blocked writer thread if the queue was full
-        if (tx_queue.wait_tx_queue.size > 0) {
-            TCB* waken = TCBList_dequeue(&tx_queue.wait_tx_queue);
-            waken->status = Ready; // FONDAMENTALE: imposta lo stato a Ready!
-            TCBList_enqueue(&running_queue, waken);
-        }
-    } else {
-        // If the queue is empty, disable the Data Register Empty interrupt
-        UCSR0B &= ~(_BV(UDRIE0));
-    }
-}
-
-// Interrupt Service Routine for USART0 Receive Complete
-ISR(USART0_RX_vect) {
-    // Read the received byte from the hardware data register
-    uint8_t data = UDR0;
+    // Block the thread until at least one byte is received
+    sem_wait(&full_sem_rx);
     
-    // Check if the receive queue is NOT full
-    if (((rx_queue.head + 1) & (MQ_MAX_SIZE - 1)) != rx_queue.tail) {
-        // Cast the byte to a void* pointer to store it in the queue
-        void* message = (void*)(uintptr_t)data;
-        rx_queue.buffer[rx_queue.head] = message;
+    cli();
+    uint8_t data_extracted = 0;
+    RingBuffer_pop(&rx_buffer, &data_extracted);
+    sei();
+    
+    return (char)data_extracted;
+}
 
-        // Wake up a blocked reader thread if any were waiting for data
-        if (rx_queue.wait_rx_queue.size > 0) {
-            TCB* waken = TCBList_dequeue(&rx_queue.wait_rx_queue);
-            waken->status = Ready;
-            TCBList_enqueue(&running_queue, waken);
-        }
-
-        // Increment the head index using circular masking
-        rx_queue.head = (rx_queue.head + 1) & (MQ_MAX_SIZE - 1);
-    }
-    // If the queue is full, the data byte is discarded :(
+unsigned char usart_kbhit(void) {
+    if (rx_buffer.head == rx_buffer.tail) return 0;
+    else return 1;
 }
 
 void usart_pstr(char *s) {
-    // loop through entire string
     while (*s) { 
         usart_putchar(*s);
         s++;
     }
 }
  
-// this function is called by printf as a stream handler
 int usart_putchar_printf(char var, FILE *stream) {
-    // translate \n to \r for br@y++ terminal
     if (var == '\n') usart_putchar('\r');
     usart_putchar(var);
     return 0;
 }
 
 void uart_init(void){
-  // fire up the usart
-  usart_init ( MYUBRR );
+    usart_init(MYUBRR);
+}
+
+// ********************************************************************************
+// ISRs
+// ********************************************************************************
+
+// USART Data Register Empty ISR
+ISR(USART0_UDRE_vect) {
+    uint8_t data;
+    if (RingBuffer_pop(&tx_buffer, &data) == OK) {
+        UDR0 = data;
+        // Signal that a slot has been freed up in the TX buffer
+        sem_post(&empty_sem_tx);
+    } else {
+        // Buffer empty, disable the interrupt to prevent endless loops
+        UCSR0B &= ~(_BV(UDRIE0));
+    }
+}
+
+// USART Receive Complete ISR
+ISR(USART0_RX_vect) {
+    uint8_t data = UDR0;
+    
+    // Non-blocking write: if the buffer is full, incoming data is safely discarded
+    if (RingBuffer_push(&rx_buffer, data) == OK) {
+        // Signal that a new byte is available for reading
+        sem_post(&full_sem_rx);
+    }
 }
